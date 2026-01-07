@@ -4,7 +4,6 @@
 #include <bit_lib.h>
 #include <lib/nfc/protocols/nfc_protocol.h>
 #include "../api/metroflip/metroflip_api.h"
-#include "../api/suica/suica_loading.h"
 #define TAG "Metroflip:Scene:Load"
 #include "keys.h"
 #include <nfc/protocols/mf_classic/mf_classic.h>
@@ -116,20 +115,12 @@ void metroflip_scene_load_on_enter(void* context) {
 
                     mf_desfire_free(data);
                 } else if(strcmp(protocol_name, "FeliCa") == 0) {
-                    do {
-                        uint32_t data_format_version = 0;
-                        bool read_success = flipper_format_read_uint32(
-                            format, "Data format version", &data_format_version, 1);
-                        if(!read_success || data_format_version != 2) break;
-                        // data format version 2 => post API 87.0 i.e. OFW #4254
-                        // If we didn't find a format version, it should be saved by previous Metroflip version
-                        // So we let it fall through to the Japan Transit IC logic below
-                        app->card_type = "suica";
-                        app->is_desfire = false;
-                        app->data_loaded = true;
-                        load_suica_data(app, format, false);
-                        FURI_LOG_I(TAG, "Detected: FeliCa (API 87.0+)");
-                    } while(false);
+                    // Suica plugin temporarily disabled due to API incompatibility
+                    // FeliCa files will show as unsupported until Suica is fixed
+                    app->card_type = "unknown";
+                    app->is_desfire = false;
+                    app->data_loaded = false;
+                    FURI_LOG_I(TAG, "FeliCa detected but Suica plugin is disabled");
                 } else if(strcmp(protocol_name, "ST25TB") == 0) {
                     app->card_type = "intertic";
                     app->is_desfire = false;
@@ -139,12 +130,12 @@ void metroflip_scene_load_on_enter(void* context) {
             const char* card_str = furi_string_get_cstr(card_type_str);
 
             if(strcmp(card_str, "Japan Transit IC") == 0) {
-                FURI_LOG_I(TAG, "Detected: Japan Transit IC");
-                app->card_type = "suica";
+                // Suica plugin temporarily disabled due to API incompatibility
+                // Legacy FeliCa files will show as unsupported until Suica is fixed
+                FURI_LOG_I(TAG, "Japan Transit IC detected but Suica plugin is disabled");
+                app->card_type = "unknown";
                 app->is_desfire = false;
-                app->data_loaded = true;
-                load_suica_data(app, format, true);
-                // This format is deprecated after OFW #4254 but kept for backward compatibility
+                app->data_loaded = false;
             } else if(strcmp(card_str, "calypso") == 0) {
                 app->card_type = "calypso";
                 app->is_desfire = false;
