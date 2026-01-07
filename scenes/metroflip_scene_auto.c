@@ -200,9 +200,7 @@ bool metroflip_scene_auto_on_event(void* context, SceneManagerEvent event) {
                 NfcProtocolFelica) {
                 // Suica plugin temporarily disabled due to API incompatibility
                 // FeliCa cards will show as unsupported until Suica is fixed
-                app->card_type = "Unknown Card";
-                Popup* popup = app->popup;
-                popup_set_header(popup, "FeliCa\nComing Soon", 58, 31, AlignLeft, AlignTop);
+                app->card_type = "FeliCa (Coming Soon)";
                 app->is_desfire = false;
                 scene_manager_next_scene(app->scene_manager, MetroflipSceneParse);
                 consumed = true;
