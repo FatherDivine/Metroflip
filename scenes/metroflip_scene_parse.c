@@ -8,6 +8,9 @@
 void metroflip_scene_parse_on_enter(void* context) {
     Metroflip* app = context;
     
+    // Initialize plugin_loaded to false at the start
+    app->plugin_loaded = false;
+    
     FURI_LOG_I(TAG, "Parse scene entered - card_type: %s, data_loaded: %s", 
                app->card_type ? app->card_type : "NULL", 
                app->data_loaded ? "true" : "false");
@@ -32,8 +35,10 @@ void metroflip_scene_parse_on_enter(void* context) {
                 app->card_type = "tmoney"; 
                 //for now we blank out the line above as it's not merged yet
                 view_dispatcher_send_custom_event(app->view_dispatcher, MetroflipCustomEventWrongCard);
+                return;
             } else {
                 view_dispatcher_send_custom_event(app->view_dispatcher, MetroflipCustomEventWrongCard);
+                return;
             }
         }
         FURI_LOG_I(TAG, "Card is valid, loading plugin for: %s", app->card_type);
@@ -46,12 +51,29 @@ void metroflip_scene_parse_on_enter(void* context) {
 
         // Try loading the plugin
         if(plugin_manager_load_single(app->plugin_manager, path) != PluginManagerErrorNone) {
-            FURI_LOG_E(TAG, "Failed to load parse plugin");
+            FURI_LOG_E(TAG, "Failed to load plugin: %s", path);
+            // Clean up the plugin manager we allocated
+            plugin_manager_free(app->plugin_manager);
+            composite_api_resolver_free(app->resolver);
+            // Show user-friendly error
+            view_dispatcher_send_custom_event(app->view_dispatcher, MetroflipCustomEventWrongCard);
             return;
         }
 
-        // Get and run the plugin's on_enter function
+        // Verify the plugin entry point is valid
         const MetroflipPlugin* plugin = plugin_manager_get_ep(app->plugin_manager, 0);
+        if(!plugin || !plugin->plugin_on_enter || !plugin->plugin_on_event || !plugin->plugin_on_exit) {
+            FURI_LOG_E(TAG, "Plugin loaded but has invalid entry points");
+            plugin_manager_free(app->plugin_manager);
+            composite_api_resolver_free(app->resolver);
+            view_dispatcher_send_custom_event(app->view_dispatcher, MetroflipCustomEventWrongCard);
+            return;
+        }
+
+        // Mark plugin as successfully loaded
+        app->plugin_loaded = true;
+        
+        // Get and run the plugin's on_enter function
         plugin->plugin_on_enter(app);
     }
 }
@@ -70,26 +92,32 @@ bool metroflip_scene_parse_on_event(void* context, SceneManagerEvent event) {
         return true;
     }
 
-    // Get and run the plugin's on_event function
-    const MetroflipPlugin* plugin = plugin_manager_get_ep(app->plugin_manager, 0);
-    return plugin->plugin_on_event(app, event);
+    // Only call plugin event handler if plugin was successfully loaded
+    if(app->plugin_loaded) {
+        const MetroflipPlugin* plugin = plugin_manager_get_ep(app->plugin_manager, 0);
+        if(plugin && plugin->plugin_on_event) {
+            return plugin->plugin_on_event(app, event);
+        }
+    }
+    
+    return false;
 }
 
 void metroflip_scene_parse_on_exit(void* context) {
     Metroflip* app = context;
-    if(!(!app->card_type ||
-   (app->card_type[0] == '\0') ||
-   (strcmp(app->card_type, "unknown") == 0) ||
-   (strcmp(app->card_type, "Unknown Card") == 0) ||
-   (app->is_desfire && is_desfire_locked(app->card_type)))) {
-        // Get and run the plugin's on_exit function
+    
+    // Only clean up plugin if it was successfully loaded
+    if(app->plugin_loaded) {
         const MetroflipPlugin* plugin = plugin_manager_get_ep(app->plugin_manager, 0);
-        plugin->plugin_on_exit(app);
+        if(plugin && plugin->plugin_on_exit) {
+            plugin->plugin_on_exit(app);
+        }
 
         plugin_manager_free(app->plugin_manager);
         composite_api_resolver_free(app->resolver);
-        app->is_desfire = false;
+        app->plugin_loaded = false;
     }
     
+    app->is_desfire = false;
     app->data_loaded = false;
 }
