@@ -2,68 +2,54 @@
 // Made by @hazardousvoltage
 // Based on my own research, with...
 // Credit to https://www.lenrek.net/experiments/compass-tickets/ & MetroDroid project for underlying info
-// Credit to FatherDivine (Github) for adding the "stop IDs & stop names" database (& code tweaks).
+// Credit to @FatherDivine (Github) for Metroflip integration, stop IDs & stop names database, and code tweaks.
 //
 // This parser can decode the paper single-use and single/multi-day paper passes using Ultralight EV1
 // The plastic cards are DESFire and fully locked down, not much useful info extractable
-// TODO:
-// - Sort the duplicate/rare ticket types
-// - (WIP) Database of stop IDs for trains, buses. There's just too damn many, but you can find them here:
-//   https://data.cityofchicago.org/Transportation/CTA-Bus-Stops-kml/84eu-buny/about_data
-//   Currently the database is cta_stops.csv in /ext/apps_data/ventra/cta_stops.csv (see below).
-//   Seems Ventra uses it's own "Cubic ID" in it's backend and matches w/ CTA's stop IDs.
-//   If true, will need to gather from Ventra or manually get enough tags/stops on a tag to decipher.
-//   For manual adding to the CSV, you have to just know where the stop was when it was scanned and lookup on google maps.
-// - Speedup the csv process so it doesn't take so long to check the entire list. But may remove the list for now given CTA stop IDs != what's read on Ventra passes.
-// - Generalize to handle all known Cubic Nextfare Ultralight systems?  Anyone wants to send me specimen dumps, hit me up on Discord.
+//
+// Chicago Transit Authority (CTA) service types:
+//   B = Bus service
+//   T = Train (Rail) service - specifically the CTA's "L" elevated/subway system
+//
+// Station database files location:
+//   files/ventra/stations/bus/stations.txt   - Bus stops (decimal Cubic IDs)
+//   files/ventra/stations/train/stations.txt - Rail/"L" stations (hex Cubic IDs)
 
-/* 
- * CSV STOP DATABASE FORMAT (IMPORTANT)
- *
- * This parser supports unified lookup for BOTH bus and train stops.
- *
- * Store IDs EXACTLY as strings:
- *
- *   Bus stops  → decimal Cubic stop IDs
- *       Example: 16959,Harlem & Addison
- *
- *   Train stops → 4‑digit uppercase hex Cubic station IDs
- *       Example: 003B,Jefferson Park
- *
- * The parser will:
- *   - Convert bus locus → decimal string
- *   - Convert train locus → 4‑digit uppercase hex
- *   - Look up both in the same CSV
- *
- * CSV path:
- *   /ext/apps_data/ventra/cta_stops.csv
- */
+#include <flipper_application.h>
+#include "../../metroflip_i.h"
 
-#include "nfc_supported_card_plugin.h"
-
-#include <flipper_application/flipper_application.h>
-#include <nfc/protocols/mf_ultralight/mf_ultralight.h>
-#include "datetime.h"
+#include <dolphin/dolphin.h>
+#include <bit_lib.h>
 #include <furi_hal.h>
+#include <nfc/nfc.h>
+#include <nfc/nfc_device.h>
+#include "../../api/metroflip/metroflip_api.h"
+#include "../../metroflip_plugins.h"
 
-// Added for stop database lookup
+#include <nfc/protocols/mf_ultralight/mf_ultralight.h>
+#include <nfc/protocols/mf_ultralight/mf_ultralight_poller.h>
+
 #include <storage/storage.h>
+#include <stream/stream.h>
+#include <stream/file_stream.h>
 #include <stdio.h>
 #include <string.h>
 
-#define TAG "Ventra"
+#define TAG "Metroflip:Scene:Ventra"
 
-// Path to the CSV stop database on SD card
-#define VENTRA_STOP_DB_PATH "/ext/apps_data/ventra/cta_stops.csv"
+// Path to station database files (bundled with app via fap_file_assets)
+#define VENTRA_BUS_STATIONS_PATH    APP_ASSETS_PATH("ventra/stations/bus/stations.txt")
+#define VENTRA_TRAIN_STATIONS_PATH  APP_ASSETS_PATH("ventra/stations/train/stations.txt")
 
-DateTime ventra_exp_date = {0}, ventra_validity_date = {0};
-uint8_t ventra_high_seq = 0, ventra_cur_blk = 0, ventra_mins_active = 0;
+// Static global state for parsing (reset on each parse)
+static DateTime ventra_exp_date = {0}, ventra_validity_date = {0};
+static uint8_t ventra_high_seq = 0, ventra_cur_blk = 0, ventra_mins_active = 0;
 
-uint32_t time_now() {
+static uint32_t ventra_time_now(void) {
     return furi_hal_rtc_get_timestamp();
 }
 
-static DateTime dt_delta(DateTime dt, uint8_t delta_days) {
+static DateTime ventra_dt_delta(DateTime dt, uint8_t delta_days) {
     // returns shifted DateTime, from initial DateTime and time offset in seconds
     DateTime dt_shifted = {0};
     datetime_timestamp_to_datetime(
@@ -86,10 +72,10 @@ static long dt_diff(DateTime dta, DateTime dtb) {
 //   - For passes, n days after first use
 //   - For tickets, 2 hours after first use
 //   Calculating these is dumber than it needs to be, see xact record parser.
-bool isExpired(void) {
+static bool ventra_is_expired(void) {
     uint32_t ts_hard_exp = datetime_datetime_to_timestamp(&ventra_exp_date);
     uint32_t ts_soft_exp = datetime_datetime_to_timestamp(&ventra_validity_date);
-    uint32_t ts_now = time_now();
+    uint32_t ts_now = ventra_time_now();
     return (ts_now >= ts_hard_exp || ts_now > ts_soft_exp);
 }
 
@@ -140,18 +126,24 @@ static bool ventra_read_line(File* file, char* buf, size_t buf_size) {
     return true;
 }
 
-/* Unified CSV lookup for bus (decimal) and train (hex) IDs.
+/* Station lookup for bus (decimal) and train (hex) IDs.
  *
- * CSV format (IDs stored as exact strings):
+ * File format (IDs stored as exact strings):
  *   Bus:   16959,Harlem & Addison
  *   Train: 003B,Jefferson Park
+ *
+ * Line type determines which file to search:
+ *   line == 1 → Train (VENTRA_TRAIN_STATIONS_PATH)
+ *   line == 2 → Bus (VENTRA_BUS_STATIONS_PATH)
  */
-static bool ventra_lookup_stop_name_str(const char* id_str, char* out_name, size_t out_size) {
+static bool ventra_lookup_stop_name_str(const char* id_str, uint8_t line_type, char* out_name, size_t out_size) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     if(!storage) return false;
 
+    const char* file_path = (line_type == 1) ? VENTRA_TRAIN_STATIONS_PATH : VENTRA_BUS_STATIONS_PATH;
+
     File* file = storage_file_alloc(storage);
-    if(!storage_file_open(file, VENTRA_STOP_DB_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+    if(!storage_file_open(file, file_path, FSAM_READ, FSOM_OPEN_EXISTING)) {
         storage_file_close(file);
         storage_file_free(file);
         furi_record_close(RECORD_STORAGE);
@@ -162,6 +154,9 @@ static bool ventra_lookup_stop_name_str(const char* id_str, char* out_name, size
     bool found = false;
 
     while(ventra_read_line(file, line, sizeof(line))) {
+        // Skip comment lines
+        if(line[0] == '#') continue;
+
         char* comma = strchr(line, ',');
         if(!comma) continue;
 
@@ -223,7 +218,7 @@ static FuriString* ventra_parse_xact(const MfUltralightData* data, uint8_t blk, 
     uint8_t line = data->page[blk + 2].data[3];
 
     // This computes the block timestamp, based on the card expiration date and delta from it
-    DateTime dt = dt_delta(ventra_exp_date, day);
+    DateTime dt = ventra_dt_delta(ventra_exp_date, day);
     dt.hour = (ts & 0x7FF) / 60;
     dt.minute = (ts & 0x7FF) % 60;
 
@@ -244,7 +239,7 @@ static FuriString* ventra_parse_xact(const MfUltralightData* data, uint8_t blk, 
         // updated and carried forward.  That, plus transaction timestamp, gives the expiration time.
         if(tran_type == 6) { // Furthermore, purchase transactions set bogus expiration dates
             if(is_pass) {
-                ventra_validity_date = dt_delta(ventra_exp_date, exp_day);
+                ventra_validity_date = ventra_dt_delta(ventra_exp_date, exp_day);
                 ventra_validity_date.hour = (exp & 0x7FF) / 60;
                 ventra_validity_date.minute = (exp & 0x7FF) % 60;
             } else {
@@ -255,13 +250,9 @@ static FuriString* ventra_parse_xact(const MfUltralightData* data, uint8_t blk, 
         }
     }
 
-    // Type 0 = Purchase, 1 = Train ride, 2 = Bus ride
-    // TODO: Check PACE and see if it uses a different line code
+    // Type 0 = Purchase, 1 = Train (T), 2 = Bus (B)
+    // CTA uses "T" for Train (Rail/"L" system) and "B" for Bus
     char linemap[3] = "PTB";
-
-    // Original format strings:
-    // For bus (line == 2): "%c %5d %04d-%02d-%02d %02d:%02d"
-    // Else:                "%c %04X %04d-%02d-%02d %02d:%02d"
 
     // Unified bus/train stop lookup
     char stop_name[128];
@@ -271,19 +262,16 @@ static FuriString* ventra_parse_xact(const MfUltralightData* data, uint8_t blk, 
     // Convert locus → lookup key (decimal for bus, hex for train)
     ventra_format_id(locus, line, id_key, sizeof(id_key));
 
-    // Look up the formatted key in the CSV
-    have_name = ventra_lookup_stop_name_str(id_key, stop_name, sizeof(stop_name));
+    // Look up the formatted key in the appropriate station file
+    have_name = ventra_lookup_stop_name_str(id_key, line, stop_name, sizeof(stop_name));
 
     if(have_name) {
-        // Use the CSV name + the exact ID key used for lookup
-        // The (V %s) puts a V for Ventra as we're using Ventra IDs in the dabatase (least first 2 entries for now)
-        // And the other ones in the database csv are actual CTA stops, but Ventra seems to not use those.
+        // Use the station name + the exact ID key used for lookup
         furi_string_printf(
             ventra_xact_str,
-            "%c %s (V %s) %04d-%02d-%02d %02d:%02d",
+            "%c %s\n  %04d-%02d-%02d %02d:%02d",
             (line < 3) ? linemap[line] : '?',
             stop_name,
-            id_key,
             dt.year,
             dt.month,
             dt.day,
@@ -319,11 +307,21 @@ static FuriString* ventra_parse_xact(const MfUltralightData* data, uint8_t blk, 
     return (ventra_xact_str);
 }
 
-static bool ventra_parse(const NfcDevice* device, FuriString* parsed_data) {
-    furi_assert(device);
-    furi_assert(parsed_data);
+// Reset global state before each parse
+static void ventra_reset_state(void) {
+    ventra_exp_date = (DateTime){0};
+    ventra_validity_date = (DateTime){0};
+    ventra_high_seq = 0;
+    ventra_cur_blk = 0;
+    ventra_mins_active = 0;
+}
 
-    const MfUltralightData* data = nfc_device_get_data(device, NfcProtocolMfUltralight);
+static bool ventra_parse(FuriString* parsed_data, const MfUltralightData* data) {
+    furi_assert(parsed_data);
+    furi_assert(data);
+
+    // Reset state for fresh parse
+    ventra_reset_state();
 
     bool parsed = false;
 
@@ -415,7 +413,7 @@ static bool ventra_parse(const NfcDevice* device, FuriString* parsed_data) {
                 break;
             }
         }
-        if(isExpired()) {
+        if(ventra_is_expired()) {
             card_state = 4;
             rides_left = 0;
         }
@@ -469,18 +467,169 @@ static bool ventra_parse(const NfcDevice* device, FuriString* parsed_data) {
     return parsed;
 }
 
+static NfcCommand ventra_poller_callback(NfcGenericEvent event, void* context) {
+    furi_assert(event.protocol == NfcProtocolMfUltralight);
+
+    Metroflip* app = context;
+    const MfUltralightPollerEvent* mf_ultralight_event = event.event_data;
+
+    if(mf_ultralight_event->type == MfUltralightPollerEventTypeReadSuccess) {
+        nfc_device_set_data(
+            app->nfc_device, NfcProtocolMfUltralight, nfc_poller_get_data(app->poller));
+
+        const MfUltralightData* data =
+            nfc_device_get_data(app->nfc_device, NfcProtocolMfUltralight);
+        uint32_t poller_event = (data->pages_read == data->pages_total) ?
+                                    MetroflipCustomEventPollerSuccess :
+                                    MetroflipCustomEventPollerFail;
+        view_dispatcher_send_custom_event(app->view_dispatcher, poller_event);
+        return NfcCommandStop;
+    } else if(mf_ultralight_event->type == MfUltralightPollerEventTypeAuthRequest) {
+        view_dispatcher_send_custom_event(app->view_dispatcher, MetroflipCustomEventPollerFail);
+    } else if(mf_ultralight_event->type == MfUltralightPollerEventTypeAuthSuccess) {
+        view_dispatcher_send_custom_event(app->view_dispatcher, MetroflipCustomEventPollerSuccess);
+    }
+
+    return NfcCommandContinue;
+}
+
+static void ventra_on_enter(Metroflip* app) {
+    dolphin_deed(DolphinDeedNfcRead);
+
+    if(app->data_loaded) {
+        FURI_LOG_I(TAG, "Ventra data loaded from file");
+        Storage* storage = furi_record_open(RECORD_STORAGE);
+        FlipperFormat* ff = flipper_format_file_alloc(storage);
+        if(flipper_format_file_open_existing(ff, app->file_path)) {
+            MfUltralightData* ultralight_data = mf_ultralight_alloc();
+            mf_ultralight_load(ultralight_data, ff, 2);
+            FuriString* parsed_data = furi_string_alloc();
+            Widget* widget = app->widget;
+
+            furi_string_reset(app->text_box_store);
+            if(!ventra_parse(parsed_data, ultralight_data)) {
+                furi_string_reset(app->text_box_store);
+                FURI_LOG_I(TAG, "Unknown card type");
+                furi_string_printf(parsed_data, "\e#Unknown card\n");
+            }
+            widget_add_text_scroll_element(
+                widget, 0, 0, 128, 64, furi_string_get_cstr(parsed_data));
+
+            widget_add_button_element(
+                widget, GuiButtonTypeRight, "Exit", metroflip_exit_widget_callback, app);
+            widget_add_button_element(
+                widget, GuiButtonTypeCenter, "Delete", metroflip_delete_widget_callback, app);
+            mf_ultralight_free(ultralight_data);
+            furi_string_free(parsed_data);
+            view_dispatcher_switch_to_view(app->view_dispatcher, MetroflipViewWidget);
+        }
+        flipper_format_free(ff);
+        furi_record_close(RECORD_STORAGE);
+    } else {
+        FURI_LOG_I(TAG, "Ventra waiting for card");
+        // Setup view
+        Popup* popup = app->popup;
+        popup_set_header(popup, "Apply\n card to\nthe back", 68, 30, AlignLeft, AlignTop);
+        popup_set_icon(popup, 0, 3, &I_RFIDDolphinReceive_97x61);
+
+        // Start worker
+        view_dispatcher_switch_to_view(app->view_dispatcher, MetroflipViewPopup);
+        app->poller = nfc_poller_alloc(app->nfc, NfcProtocolMfUltralight);
+        nfc_poller_start(app->poller, ventra_poller_callback, app);
+
+        metroflip_app_blink_start(app);
+    }
+}
+
+static bool ventra_on_event(Metroflip* app, SceneManagerEvent event) {
+    bool consumed = false;
+
+    if(event.type == SceneManagerEventTypeCustom) {
+        if(event.event == MetroflipCustomEventCardDetected) {
+            Popup* popup = app->popup;
+            popup_set_header(popup, "DON'T\nMOVE", 68, 30, AlignLeft, AlignTop);
+            consumed = true;
+        } else if(event.event == MetroflipCustomEventPollerSuccess) {
+            const MfUltralightData* ultralight_data =
+                nfc_device_get_data(app->nfc_device, NfcProtocolMfUltralight);
+            FuriString* parsed_data = furi_string_alloc();
+            Widget* widget = app->widget;
+
+            furi_string_reset(app->text_box_store);
+            if(!ventra_parse(parsed_data, ultralight_data)) {
+                furi_string_reset(app->text_box_store);
+                FURI_LOG_I(TAG, "Unknown card type");
+                furi_string_printf(parsed_data, "\e#Unknown card\n");
+            }
+            widget_add_text_scroll_element(
+                widget, 0, 0, 128, 64, furi_string_get_cstr(parsed_data));
+            widget_add_button_element(
+                widget, GuiButtonTypeLeft, "Exit", metroflip_exit_widget_callback, app);
+            widget_add_button_element(
+                widget, GuiButtonTypeRight, "Save", metroflip_save_widget_callback, app);
+            furi_string_free(parsed_data);
+            view_dispatcher_switch_to_view(app->view_dispatcher, MetroflipViewWidget);
+            metroflip_app_blink_stop(app);
+            consumed = true;
+        } else if(event.event == MetroflipCustomEventCardLost) {
+            Popup* popup = app->popup;
+            popup_set_header(popup, "Card \n lost", 68, 30, AlignLeft, AlignTop);
+            consumed = true;
+        } else if(event.event == MetroflipCustomEventWrongCard) {
+            Popup* popup = app->popup;
+            popup_set_header(popup, "WRONG \n CARD", 68, 30, AlignLeft, AlignTop);
+            consumed = true;
+        } else if(event.event == MetroflipCustomEventPollerFail) {
+            FuriString* parsed_data = furi_string_alloc();
+            Widget* widget = app->widget;
+
+            furi_string_reset(app->text_box_store);
+            FURI_LOG_I(TAG, "Unknown card type");
+            furi_string_printf(parsed_data, "\e#Unknown card\n");
+
+            widget_add_text_scroll_element(
+                widget, 0, 0, 128, 64, furi_string_get_cstr(parsed_data));
+            widget_add_button_element(
+                widget, GuiButtonTypeRight, "Exit", metroflip_exit_widget_callback, app);
+            furi_string_free(parsed_data);
+            view_dispatcher_switch_to_view(app->view_dispatcher, MetroflipViewWidget);
+            metroflip_app_blink_stop(app);
+            consumed = true;
+        }
+    } else if(event.type == SceneManagerEventTypeBack) {
+        scene_manager_search_and_switch_to_previous_scene(app->scene_manager, MetroflipSceneStart);
+        consumed = true;
+    }
+
+    return consumed;
+}
+
+static void ventra_on_exit(Metroflip* app) {
+    widget_reset(app->widget);
+
+    if(app->poller && !app->data_loaded) {
+        nfc_poller_stop(app->poller);
+        nfc_poller_free(app->poller);
+    }
+
+    // Clear view
+    popup_reset(app->popup);
+
+    metroflip_app_blink_stop(app);
+}
+
 /* Actual implementation of app<>plugin interface */
-static const NfcSupportedCardsPlugin ventra_plugin = {
-    .protocol = NfcProtocolMfUltralight,
-    .verify = NULL,
-    .read = NULL,
-    .parse = ventra_parse,
+static const MetroflipPlugin ventra_plugin = {
+    .card_name = "Ventra",
+    .plugin_on_enter = ventra_on_enter,
+    .plugin_on_event = ventra_on_event,
+    .plugin_on_exit = ventra_on_exit,
 };
 
 /* Plugin descriptor to comply with basic plugin specification */
 static const FlipperAppPluginDescriptor ventra_plugin_descriptor = {
-    .appid = NFC_SUPPORTED_CARD_PLUGIN_APP_ID,
-    .ep_api_version = NFC_SUPPORTED_CARD_PLUGIN_API_VERSION,
+    .appid = METROFLIP_SUPPORTED_CARD_PLUGIN_APP_ID,
+    .ep_api_version = METROFLIP_SUPPORTED_CARD_PLUGIN_API_VERSION,
     .entry_point = &ventra_plugin,
 };
 
