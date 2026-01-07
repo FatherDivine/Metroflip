@@ -84,6 +84,7 @@ Metroflip* metroflip_alloc() {
     app->dialogs = furi_record_open(RECORD_DIALOGS);
 
     app->data_loaded = false;
+    app->plugin_loaded = false;
     return app;
 }
 

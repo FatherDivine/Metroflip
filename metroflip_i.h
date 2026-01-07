@@ -114,6 +114,7 @@ typedef struct {
     DialogsApp* dialogs;
 
     bool data_loaded;
+    bool plugin_loaded;  // Track if plugin was successfully loaded
 
 } Metroflip;
 
