@@ -5,3 +5,4 @@ dist/*
 .editorconfig
 .env
 .ufbt
+_codeql_detected_source_root
