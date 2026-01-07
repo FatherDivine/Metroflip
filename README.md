@@ -85,6 +85,7 @@ This is a list of metro cards and transit systems that need support or have part
 | **Suica**          | 🇯🇵 Japan                                     | FeliCa            |
 | **Troika**         | 🇷🇺 Moscow, Russia                            | MIFARE Classic    |
 | **Trt**            | 🇨🇳 Tianjin, China                            | MIFARE Ultralight |
+| **Ventra**         | 🇺🇸 Chicago, IL, USA                          | MIFARE Ultralight |
 | **Octopus**        | 🇭🇰 Hong Kong                                 | FeliCa            |
 | **nol**            | 🇦🇪 Dubai, UAE                                | MIFARE DESFire    |
 
@@ -110,6 +111,7 @@ This is a list of metro cards and transit systems that need support or have part
 - **Suica Parser:** [@zinongli](https://github.com/zinongli)
 - **Troika Parser:** [@gornekich](https://github.com/gornekich)
 - **TRT Parser:** [@luu176](https://github.com/luu176), [@zinongli](https://github.com/zinongli)
+- **Ventra Parser:** [@hazardousvoltage](https://github.com/hazardousvoltage), [@FatherDivine](https://github.com/FatherDivine)
 - **Octopus Parser:** [@zinongli](https://github.com/zinongli)
 - **nol Parser:** [@zinongli](https://github.com/zinongli)
 
